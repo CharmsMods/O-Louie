@@ -1,0 +1,558 @@
+CLIP RECORDER IMPLEMENTATION PLAN
+Research date: 2026-06-24
+Target reader: Codex / implementation agent
+
+0. IMPLEMENTATION PRINCIPLES
+- Codex owns routine development setup and may automatically download, install, update, configure, and use FFmpeg or any other dependency required to build, test, inspect, or continue the project. Missing local tooling is Codex work, not a user blocker.
+- Ask the user only when credentials/access are unavailable or a dependency decision would materially change architecture, licensing, shipping, or the user's runtime environment. Local setup authority does not authorize bundling or redistributing development-only dependencies.
+- Build the reliable core first; polish UI after end-to-end recording works.
+- Never use CPU video encoding fallback.
+- Never hook/inject into games for MVP.
+- Never retain WGC frame surfaces after frame disposal; copy to owned textures.
+- Never block the capture callback on encode, disk, mux, UI, or logging.
+- Never run Dear ImGui frames while the settings window is closed.
+- Export clips/full recordings asynchronously.
+- Prefer explicit failures over silent fallback to lower quality or CPU encode.
+
+1. REPO LAYOUT
+/src
+  /app
+    AppHost.h/.cpp
+    Settings.h/.cpp
+    Log.h/.cpp
+    SingleInstance.h/.cpp
+  /win32
+    HiddenWindow.h/.cpp
+    TrayController.h/.cpp
+    HotkeyManager.h/.cpp
+    OverlayNotifier.h/.cpp
+    WindowAffinity.h/.cpp
+  /ui
+    SettingsUi.h/.cpp
+    ImGuiDx11Host.h/.cpp
+  /graphics
+    D3D11DeviceContext.h/.cpp
+    DisplayManager.h/.cpp
+    TexturePool.h/.cpp
+    GpuScaleConvert.h/.cpp
+  /capture
+    ICaptureSource.h
+    WgcMonitorCapture.h/.cpp
+    DxgiDupCapture.h/.cpp
+  /audio
+    AudioCaptureManager.h/.cpp
+    WasapiLoopbackCapture.h/.cpp
+    WasapiMicCapture.h/.cpp
+    ProcessLoopbackCapture.h/.cpp
+    AudioResampler.h/.cpp
+    AacEncoder.h/.cpp
+  /encode
+    IVideoEncoder.h
+    MfHardwareH264Encoder.h/.cpp
+    NvencH264Encoder.stub.h/.cpp
+    EncoderCapabilities.h
+  /record
+    RecorderSession.h/.cpp
+    PacketStore.h/.cpp
+    Mp4Muxer.h/.cpp
+    ExportQueue.h/.cpp
+    Bookmark.h
+    Timebase.h/.cpp
+    RecordingRecovery.h/.cpp
+  /diagnostics
+    Metrics.h/.cpp
+/tests
+  PacketStoreTests.cpp
+  TimebaseTests.cpp
+  MuxerTests.cpp
+CMakeLists.txt
+vcpkg.json or dependency notes
+
+2. DEPENDENCIES
+Required:
+- Windows SDK with C++/WinRT headers.
+- d3d11.lib, dxgi.lib, d3dcompiler.lib or dxcompiler if shaders are compiled offline, windowsapp.lib, mfplat.lib, mf.lib, mfuuid.lib, wmcodecdspuuid.lib, avrt.lib, ole32.lib, user32.lib, shell32.lib.
+- Dear ImGui source included directly: imgui.cpp, imgui_draw.cpp, imgui_tables.cpp, imgui_widgets.cpp, imgui_impl_win32.cpp, imgui_impl_dx11.cpp.
+- FFmpeg LGPL dynamic libraries: avformat, avcodec, avutil, swresample. Avoid GPL/nonfree build flags.
+
+Optional but recommended:
+- WIL for COM RAII and HRESULT helpers.
+- nlohmann/json or a small internal JSON writer/reader.
+- spdlog or simple rotating file logger.
+
+3. THREAD MODEL
+Main/UI thread:
+- Owns hidden message window, tray, hotkey dispatch, settings window creation/destruction.
+- When settings hidden: normal message loop using GetMessage/WaitMessage; no ImGui frame loop.
+- When settings visible: render ImGui at capped FPS using timer or message pump.
+
+WGC callback thread:
+- Created by Direct3D11CaptureFramePool::CreateFreeThreaded.
+- On FrameArrived: TryGetNextFrame, timestamp, copy to owned texture or enqueue frame reference if lifetime is safe, release frame immediately.
+- If queue full: drop oldest or newest according to policy; increment dropped_frame metric.
+
+Video encode thread:
+- Waits on bounded frame queue.
+- Performs FPS limiter/drop decision.
+- Performs GPU scale/color conversion to NV12.
+- Submits to hardware encoder.
+- Drains encoded output packets.
+- Writes packets to PacketStore.
+
+Audio capture threads:
+- WASAPI event-driven capture per source.
+- Push PCM blocks with stream-relative timestamps into audio encode queues.
+
+Audio encode thread(s):
+- Resample/format convert to 48 kHz S16 or encoder-required format.
+- Encode AAC frames.
+- Write AAC packets to PacketStore.
+
+Export thread:
+- Handles clip/bookmark/full MP4 muxing from PacketStore packet ranges.
+- Lower priority; never blocks capture/encode.
+
+4. SETTINGS MODEL
+settings.json:
+{
+  "output_dir": "...",
+  "start_with_windows": false,
+  "show_overlay_notifications": true,
+  "monitor_id": "...",
+  "video": {
+    "resolution_mode": "source|1080p|1440p|4k|custom",
+    "custom_width": 1920,
+    "custom_height": 1080,
+    "fps": 60,
+    "bitrate_mbps": 20,
+    "rate_control": "CBR|VBR|CQP",
+    "quality_preset": "Balanced",
+    "gop_seconds": 2.0,
+    "capture_cursor": true,
+    "encoder_backend": "media_foundation_hardware"
+  },
+  "audio": {
+    "system_mix": true,
+    "mic": false,
+    "selected_process_audio": [],
+    "separate_tracks": true,
+    "default_mixed_track": true,
+    "sample_rate": 48000
+  },
+  "clips": {
+    "presets_seconds": [30, 60, 300],
+    "custom_seconds": 120,
+    "bookmark_pre_seconds": 60,
+    "bookmark_post_seconds": 0
+  },
+  "hotkeys": {
+    "toggle_recording": "Ctrl+Shift+R",
+    "save_last_30s": "Ctrl+Shift+F8",
+    "save_last_5m": "Ctrl+Shift+F9",
+    "bookmark": "Ctrl+Shift+F10"
+  }
+}
+
+Validation:
+- Width/height must be even.
+- FPS > 0 and <= safe cap selected by encoder capability.
+- Bitrate > 0.
+- If selected process audio unsupported on OS, disable UI and ignore setting with warning.
+- If hardware encoder cannot satisfy requested resolution/fps, fail recording start or ask user to reduce settings. Do not silently CPU encode.
+
+5. APP STARTUP SEQUENCE
+1. Initialize COM/WinRT.
+2. Enforce single instance; second instance opens settings or brings tray menu.
+3. Load settings, apply defaults/migrations.
+4. Create hidden message window.
+5. Create tray icon with GUID identifier.
+6. Register hotkeys using RegisterHotKey with MOD_NOREPEAT where useful.
+7. Initialize logger and diagnostics.
+8. Scan temp session folder for recoverable packet stores; expose in Advanced tab.
+9. Idle.
+
+6. START RECORDING SEQUENCE
+1. Ensure state == Idle.
+2. Resolve monitor to HMONITOR and DXGI adapter LUID.
+3. Create D3D11 device on adapter associated with selected monitor when possible. Use BGRA support and video support. Enable multithread protection if context crosses threads.
+4. Check WGC support.
+5. Create WGC GraphicsCaptureItem using CreateForMonitor(HMONITOR).
+6. Create frame pool with B8G8R8A8_UNORM, buffer count 2 or 3, monitor physical size.
+7. Create capture session. Set cursor capture true when supported. Request borderless access and set IsBorderRequired false when supported/allowed.
+8. Initialize VideoEncoder with requested output size/fps/bitrate/GOP. Hardware only.
+9. Initialize AudioCaptureManager and AAC encoders for enabled tracks.
+10. Create session folder, session.json, PacketStore.
+11. Start audio capture.
+12. Start video encode thread.
+13. Start WGC capture session.
+14. Transition to Recording and show overlay notification.
+
+7. STOP RECORDING SEQUENCE
+1. Ensure state == Recording.
+2. Transition to Stopping.
+3. Stop WGC session and release frame pool.
+4. Stop audio capture.
+5. Signal video/audio encoders to drain.
+6. Close PacketStore writer.
+7. Enqueue full-recording MP4 export job if user chose save.
+8. Transition to Idle or ExportingIdle; allow app to remain responsive.
+9. Notify "saving full recording" and later "saved" or "failed".
+
+8. WGC MONITOR CAPTURE IMPLEMENTATION NOTES
+Class: WgcMonitorCapture
+Public:
+- bool IsSupported();
+- Start(HMONITOR, ID3D11Device*, CaptureConfig, IFrameSink*);
+- Stop();
+
+Frame callback behavior:
+- On FrameArrived:
+  a. while (frame = framePool.TryGetNextFrame()) drain available frames.
+  b. read frame.SystemRelativeTime.
+  c. if frame.ContentSize or the selected monitor rectangle differs from the expected size, latch the first resize fault. The current fixed-dimension recorder stops input and finalizes the existing segment; future continuous recovery requires frame-pool recreation plus a new fixed-dimension hardware-encoder segment.
+  d. copy frame.Surface to TexturePool texture with CopyResource or CopySubresourceRegion using ContentSize.
+  e. enqueue CapturedFrame {texture, content_size, qpc_time_ns}.
+  f. release frame.
+
+Do not perform encode/mux/log-heavy operations in callback.
+
+9. DXGI DUPLICATION FALLBACK NOTES
+Class: DxgiDupCapture
+- Use IDXGIOutput1::DuplicateOutput.
+- AcquireNextFrame loop on dedicated thread.
+- Copy acquired texture to owned D3D11 texture.
+- Handle DXGI_ERROR_ACCESS_LOST by recreating duplication.
+- Handle rotation per output desc.
+- Compose pointer only when DXGI_OUTDUPL_FRAME_INFO reports separate visible pointer.
+- ReleaseFrame every iteration.
+
+10. GPU SCALE AND COLOR CONVERSION
+Inputs:
+- Capture texture: BGRA8 SDR.
+- Output encoder wants NV12, even dimensions.
+
+MVP options:
+- D3D11 VideoProcessor path: BGRA -> NV12 with optional scaling.
+- Shader path: render/compute conversion to NV12 textures if VideoProcessor path is unreliable.
+
+Requirements:
+- Do not map textures to CPU.
+- Output timestamps follow original captured frame timestamp after frame dropping.
+- If resolution changes, reset converter and encoder; force new keyframe after restart.
+
+11. VIDEO ENCODER INTERFACE
+struct EncodedVideoPacket {
+  int64_t pts_ns;
+  int64_t dts_ns;
+  int64_t duration_ns;
+  bool keyframe;
+  std::vector<uint8_t> data;
+};
+
+class IVideoEncoder {
+ public:
+  virtual EncoderCapabilities GetCapabilities() const = 0;
+  virtual void Initialize(const VideoEncoderConfig&, ID3D11Device*) = 0;
+  virtual void Encode(ID3D11Texture2D* nv12_or_bgra_texture, int64_t pts_ns, bool force_idr) = 0;
+  virtual std::vector<EncodedVideoPacket> DrainAvailable() = 0;
+  virtual std::vector<EncodedVideoPacket> Flush() = 0;
+  virtual H264Config GetH264Config() const = 0; // SPS/PPS/extradata, packet format
+};
+
+MVP Media Foundation hardware backend:
+- Enumerate MFT_CATEGORY_VIDEO_ENCODER with MFTEnumEx.
+- Flags: MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, include MFT_ENUM_FLAG_LOCALMFT if needed.
+- Input type: NV12 video.
+- Output type: H.264 video.
+- Reject if no hardware MFT found.
+- Configure bitrate, profile High/Main, FPS, frame size, GOP.
+- Use DXGI device manager and D3D11-aware MFT path when available.
+- Hardware MFTs are async; implement event/output drain correctly.
+- Record backend name and all selected capabilities in diagnostics.
+
+NVENC later backend:
+- Load nvEncodeAPI.dll at runtime.
+- Use Video Codec SDK D3D11 path.
+- Accept BGRA or NV12 depending on mode; prefer NV12 for predictable 4:2:0 output.
+- Use H.264 high profile, no B-frames for MVP, 2-second GOP, low-latency/high-quality preset depending on setting.
+- Query capabilities before exposing CQP/advanced presets.
+
+12. AUDIO CAPTURE IMPLEMENTATION
+Track types:
+- Track 1 optional default mixed AAC.
+- Track 2 system loopback AAC.
+- Track 3 mic AAC.
+- Track 4+ process-loopback AAC.
+
+WASAPI loopback:
+- Enumerate render endpoints.
+- Initialize IAudioClient on selected render endpoint with AUDCLNT_STREAMFLAGS_LOOPBACK.
+- Use event-driven shared mode where possible.
+- Capture packets via IAudioCaptureClient.
+
+Mic capture:
+- Enumerate capture endpoints.
+- Initialize shared-mode capture.
+- Use same timing strategy as loopback.
+
+Process loopback:
+- Use ActivateAudioInterfaceAsync sample pattern with process tree include/exclude.
+- Enable only on build >= 20348.
+- If process has no audio render streams, capture will be silence; expose this in diagnostics.
+
+AAC encoding:
+- Prefer 48 kHz.
+- Convert to 16-bit PCM if using Media Foundation AAC encoder.
+- AAC-LC output.
+- Preserve per-track PTS/duration.
+
+13. TIMEBASE AND SYNC
+Use Timebase service:
+- qpc_frequency.
+- session_start_qpc.
+- QpcToNs(qpc) = (qpc - session_start_qpc) * 1e9 / qpc_frequency.
+
+Video:
+- pts_ns = QpcToNs(frame.SystemRelativeTime).
+- With b_frames=0, dts_ns = pts_ns.
+- duration_ns = next_frame_pts - this_frame_pts when known, else configured frame duration.
+
+Audio:
+- For each source, choose source_start_qpc at first captured buffer.
+- pts_ns = QpcToNs(source_start_qpc) + samples_captured_before_buffer * 1e9 / sample_rate.
+- duration_ns = sample_count * 1e9 / sample_rate.
+- Resample/adjust if drift against video clock exceeds threshold over long recording.
+
+Mux:
+- Convert ns to stream time base exactly with av_rescale_q.
+- Maintain monotonic DTS per track.
+- If an audio packet starts before clip start, include or trim only if encoder supports safe trimming. MVP can include overlapping audio from aligned keyframe start.
+
+14. PACKET STORE IMPLEMENTATION
+Class: PacketStore
+Public:
+- Create(session_dir, track_defs)
+- AppendPacket(track_id, pts_ns, dts_ns, duration_ns, flags, span<uint8_t>)
+- SnapshotIndex()
+- QueryRange(start_ns, end_ns, include_previous_keyframe)
+- Close()
+- Recover(session_dir)
+
+Write rules:
+- Append packet header + payload in one locked writer section.
+- Do not flush every packet by default; flush every segment/keyframe or every 1-5 seconds. On clip request, flush before export query.
+- Keep in-memory index append-only during recording.
+- Periodically write checkpoint index.
+- Atomic writes for session.json updates/bookmarks.
+
+QueryRange:
+- Find requested start_ns.
+- Find previous video keyframe <= start_ns.
+- Range start = keyframe pts.
+- Range end = requested end_ns.
+- Return packet refs for every track overlapping [range_start, range_end].
+
+15. MP4 MUXER IMPLEMENTATION
+Class: Mp4Muxer
+Public:
+- WriteMp4(output_temp_path, session_metadata, packet_refs)
+- AtomicRename(temp, final)
+
+Implementation:
+- avformat_alloc_output_context2(..., "mp4", ...)
+- Add video stream with H.264 codec parameters: width, height, extradata/SPS/PPS, time_base.
+- Add AAC streams for enabled audio tracks: sample_rate, channels/layout, extradata, time_base.
+- avformat_write_header.
+- Interleave packets by DTS using av_interleaved_write_frame.
+- av_write_trailer.
+- Rename temp to final only after success.
+
+Fragmented/recovery option later:
+- For live/recoverable MP4, use fragmented output. FFmpeg mov/mp4 supports fragmentation; normal MP4 writes metadata at end and may be undecodable if not finalized.
+- MVP can rely on PacketStore recovery and final MP4 export instead of live MP4.
+
+16. HOTKEYS
+Use RegisterHotKey on hidden window.
+- One id per action.
+- MOD_NOREPEAT where available.
+- Do not use F12.
+- If registration fails, show settings warning and keep previous hotkey disabled.
+
+Actions:
+- ToggleRecording.
+- StopAndSaveFull.
+- SaveLastPreset(index).
+- SaveLastCustom.
+- AddBookmark.
+- BookmarkAndSaveDefaultClip.
+
+WM_HOTKEY handler:
+- Translate id to command.
+- Post command to AppHost command queue.
+- Return immediately.
+
+17. TRAY AND OVERLAY
+Tray:
+- Shell_NotifyIcon NIM_ADD at startup with GUID.
+- NIM_SETVERSION to NOTIFYICON_VERSION_4.
+- Right-click menu.
+- NIM_DELETE on shutdown.
+
+Overlay:
+- Topmost layered transparent window.
+- Click-through.
+- Short fade timer.
+- Apply WDA_EXCLUDEFROMCAPTURE.
+- Render using either simple D3D11 text or lightweight Win32/GDI; avoid full ImGui loop for overlay unless already running.
+- Overlay should not create persistent high-frequency GPU work.
+
+18. DEAR IMGUI SETTINGS WINDOW
+Create only when user opens settings, or keep hidden but no render loop.
+When opened:
+- Create Win32 top-level window and D3D11 swap chain.
+- Apply WDA_EXCLUDEFROMCAPTURE.
+- Initialize ImGui context/backend.
+- Render on WM_PAINT/timer at 30-60 FPS.
+When closed:
+- Save settings.
+- Destroy or stop rendering swap chain.
+- Stop ImGui NewFrame/Render calls.
+
+19. QUALITY PRESET IMPLEMENTATION
+Preset object:
+{
+  name,
+  resolution_mode,
+  fps,
+  bitrate_mbps,
+  rate_control,
+  gop_seconds,
+  encoder_backend_specific_options
+}
+
+Default presets:
+- Low: 1080p or source below 1080p, 30 FPS, 8-12 Mbps, CBR, GOP 2s.
+- Balanced: source or 1080p/1440p, 60 FPS, 20 Mbps @1080p, 40 Mbps @1440p, 80 Mbps @4K, CBR/VBR.
+- High: source, 60 FPS, 35 Mbps @1080p, 60 Mbps @1440p, 120 Mbps @4K, VBR/high quality.
+- Custom: user editable.
+
+Backend support:
+- If CQP unsupported by current backend, gray it out.
+- If requested bitrate/resolution/fps unsupported, fail validation with exact reason.
+
+20. ERROR HANDLING AND USER NOTIFICATIONS
+Error categories:
+- Capture unsupported.
+- Monitor disappeared/resized.
+- Hardware encoder unavailable.
+- Encoder device lost.
+- Audio source unavailable/silent.
+- Disk low/full.
+- Hotkey conflict.
+- MP4 export failed.
+
+Behavior:
+- Capture/encoder fatal error latches the first typed subsystem failure, stops recording cleanly, and preserves session files.
+- D3D11 removed/reset/hung or hardware H.264 runtime failure discards queued dead-device video textures, finalizes unaffected audio plus already encoded packets, and writes the pre-fault MP4 when enough recoverable H.264 data exists. Never retry through a CPU encoder.
+- Clip export failure does not stop recording.
+- Disk full stops recording and attempts to preserve PacketStore.
+- User notifications are short; detailed error is in diagnostics/log file.
+
+21. TESTING CHECKLIST
+Unit tests:
+- Timebase conversions, monotonic DTS.
+- PacketStore append/query/recover.
+- Keyframe-aligned range query.
+- MP4 mux with fake H.264/AAC packets if available.
+- Settings migration/validation.
+
+Manual tests:
+- Idle CPU/GPU usage with tray only.
+- Start/stop recording at 1080p60.
+- Save 30s clip after 10s recording: exports available window and notifies.
+- Save 30s/5m clips during ongoing recording without dropped-frame spike.
+- Stop and save full recording.
+- UI window and overlay excluded from capture.
+- Cursor appears when visible; custom in-game cursor/crosshair not duplicated.
+- System audio only.
+- Mic only.
+- System + mic separate tracks.
+- Multi-track MP4 verified with ffprobe/VLC.
+- Display resize or monitor disconnect.
+- Encoder unavailable path.
+- Low disk path.
+- HDR desktop warning.
+- Protected content produces expected black/blocked behavior without bypass attempt.
+
+Performance tests:
+- 1080p60, 1440p60, 4K60 if hardware supports.
+- Export clips while recording.
+- Long recording > 1 hour.
+- High bitrate sustained disk write.
+- Game running borderless and fullscreen modes.
+
+22. BUILD ORDER FOR CODEX
+Milestone 1: Shell
+- CMake project, Win32 app, logger, settings, tray, hidden window, hotkeys, overlay notification stub.
+
+Milestone 2: D3D/WGC capture smoke test
+- Create D3D11 device.
+- Enumerate monitors.
+- Start WGC monitor capture.
+- Count frames and timestamps; no encode.
+- Verify UI exclusion call on overlay/settings window.
+
+Milestone 3: PacketStore + fake mux tests
+- Implement PacketStore, bookmarks, range query, recovery scan.
+- Add Mp4Muxer skeleton with test packet hooks.
+
+Milestone 4: Audio
+- WASAPI system loopback to PCM file or PacketStore raw debug.
+- Mic capture.
+- AAC encode.
+- Track timestamp sync.
+
+Milestone 5: Hardware video encoder
+- Implement Media Foundation hardware H.264 MFT enumeration.
+- Configure NV12 input, H.264 output.
+- Encode synthetic NV12 texture.
+- Encode WGC frames after GPU conversion.
+- Record SPS/PPS/extradata.
+
+Milestone 6: End-to-end recording
+- WGC -> converter -> H.264 -> PacketStore.
+- Audio -> AAC -> PacketStore.
+- Stop -> full MP4 mux.
+- Verify playback.
+
+Milestone 7: Clips/bookmarks
+- Clip hotkey range query.
+- Export last 30s/5m MP4 while recording.
+- Bookmark creation/export.
+- Notifications.
+
+Milestone 8: Settings UI
+- Dear ImGui settings window.
+- Saveable presets/hotkeys/audio config.
+- Ensure zero ImGui render when closed.
+
+Milestone 9: Robustness
+- Device lost handling.
+- Disk checks.
+- Crash recovery scan, protected export, and reversible discard through a bounded startup worker.
+- Diagnostics panel with copied low-frequency recorder/recovery facts and zero hidden rendering (implemented in Pass 144).
+- Installer/signing plan later.
+
+23. FINAL MVP DEFINITION OF DONE
+- Windows x64 executable.
+- Records selected monitor using WGC.
+- GPU-only H.264 encode.
+- WASAPI system audio and optional mic.
+- MP4 full recording.
+- MP4 clips from active recording.
+- Bookmark and export.
+- Hotkeys configurable.
+- Dear ImGui settings closed = no render loop.
+- App UI/overlay excluded from capture on supported OS.
+- Clear overlay notifications.
+- Failure cases are explicit and logged.

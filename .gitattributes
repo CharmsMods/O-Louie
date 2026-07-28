@@ -1,0 +1,61 @@
+* text=auto
+
+# Source, build metadata, documentation, and configuration use LF.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.cxx text eol=lf
+*.h text eol=lf
+*.hh text eol=lf
+*.hpp text eol=lf
+*.hxx text eol=lf
+*.inl text eol=lf
+*.rc text eol=lf
+*.in text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.ps1 text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Windows command scripts conventionally use CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never perform text conversion on binary assets or archives.
+*.bmp binary
+*.gif binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.mp3 binary
+*.wav binary
+*.flac binary
+*.aac binary
+*.m4a binary
+*.mp4 binary
+*.mkv binary
+*.mov binary
+*.avi binary
+*.wmv binary
+*.webm binary
+*.7z binary
+*.gz binary
+*.rar binary
+*.tar binary
+*.xz binary
+*.zip binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.pdb binary
